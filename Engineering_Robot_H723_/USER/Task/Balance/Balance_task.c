@@ -24,9 +24,11 @@ static gimbal_cmd_t   gimbal_out;
 static pid_obj_t *gimbal_pitch_pid;
 static pid_config_t gimbal_pitch_config = INIT_PID_CONFIG(
     GIMBAL_PID_KP, GIMBAL_PID_KI, GIMBAL_PID_KD,
-    GIMBAL_PID_INT_LIM, GIMBAL_PID_MAX_OUT,
+    GIMBAL_PID_INT_LIM, GIMBAL_PID_MAX_SPEED,
     PID_Integral_Limit | PID_Trapezoid_Intergral
 );
+static float gimbal_motor_target_angle = 0.0f;
+static uint8_t gimbal_motor_target_initialized = 0;
 /* -------------------------------- PID控制器 ------------------------------- */
 
 /* -------------------------------- 调试监测 ------------------------------- */
@@ -64,19 +66,40 @@ void BalanceTask_Entry(void const * argument)
         /* 订阅IMU姿态数据 */
         if (sub_get_msg(sub_imu_rpy, &imu_data))
         {
-            /* 以Pitch角度为反馈,目标为水平(0度),PID输出云台电机目标角度 */
-            float pid_out = pid_calculate(gimbal_pitch_pid, imu_data.pitch, GIMBAL_TARGET_PITCH);
-            float ff_out = -(imu_data.pitch - GIMBAL_TARGET_PITCH) *
-                           GIMBAL_DEG_TO_RAD * GIMBAL_PITCH_FF_GAIN;
-            float motor_target_angle = pid_out + ff_out;
+            if (!gimbal_motor_target_initialized)
+            {
+                if (motor[Motor8].para.state != 0)
+                {
+                    gimbal_motor_target_angle = motor[Motor8].para.pos;
+                    gimbal_motor_target_initialized = 1;
+                    pid_clear(gimbal_pitch_pid);
+                    (void)pid_calculate(gimbal_pitch_pid, imu_data.pitch, GIMBAL_TARGET_PITCH);
+                }
+            }
+            else
+            {
+                /* Pitch姿态环输出目标速度，再积分得到电机目标角度 */
+                float target_speed = pid_calculate(gimbal_pitch_pid,
+                                                   imu_data.pitch,
+                                                   GIMBAL_TARGET_PITCH);
+                float control_dt = gimbal_pitch_pid->dt;
 
-            if (motor_target_angle > GIMBAL_PID_MAX_OUT)
-                motor_target_angle = GIMBAL_PID_MAX_OUT;
-            else if (motor_target_angle < -GIMBAL_PID_MAX_OUT)
-                motor_target_angle = -GIMBAL_PID_MAX_OUT;
+                if (imu_data.pitch * imu_data.pitch < 0.0225f)
+                    target_speed = 0.0f;
+
+                if (control_dt > GIMBAL_CONTROL_DT_MAX)
+                    control_dt = GIMBAL_CONTROL_DT_MAX;
+
+                gimbal_motor_target_angle += target_speed * control_dt;
+
+                if (gimbal_motor_target_angle > GIMBAL_PITCH_MAX)
+                    gimbal_motor_target_angle = GIMBAL_PITCH_MAX;
+                else if (gimbal_motor_target_angle < GIMBAL_PITCH_MIN)
+                    gimbal_motor_target_angle = GIMBAL_PITCH_MIN;
+            }
 
             /* 限制输出范围并赋值 */
-            gimbal_out.pitch_motor_angle = motor_target_angle;
+            gimbal_out.pitch_motor_angle = gimbal_motor_target_angle;
             gimbal_out.yaw_motor_angle   = 0.0f;  // 暂不控制偏航
 
             /* 发布云台电机控制命令 */
