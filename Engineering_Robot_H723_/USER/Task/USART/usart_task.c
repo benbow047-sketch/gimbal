@@ -1,0 +1,503 @@
+/**
+  ******************************************************************************
+  * @file    algorithm_task.c
+  * @author  Liu JiaJun(187353224@qq.com)
+  * @version V1.0.0
+  * @date    2025-01-10
+  * @brief   机器人算法任务线程，处理复杂算法，避免在其他线程中计算造成阻塞
+  ******************************************************************************
+  * @attention
+  *
+  * 本代码遵循GPLv3开源协议，仅供学习交流使用
+  * 未经许可不得用于商业用途
+  *
+  ******************************************************************************
+  */
+#include "usart_task.h"
+#include "FreeRTOS.h"
+
+#include "rc_sbus.h"
+#include "vt13_vt03.h"
+
+#include "referee_system.h"
+#include "usart.h"
+#include <string.h>
+#include "drv_dwt.h"
+#include "cmd_task.h"
+#include "algorithm_task.h"
+#include "msg_freertos.h"
+#include "tim.h"
+
+#include <stdio.h>
+#include <stdarg.h>
+
+/* -------------------------------- 线程间通讯Topics相关 ------------------------------- */
+//static struct chassis_cmd_msg chassis_cmd;
+//static struct chassis_fdb_msg chassis_fdb;
+//static struct trans_fdb_msg trans_fdb;
+//static struct ins_msg ins_data;
+//
+//static publisher_t *pub_chassis;
+//static subscriber_t *sub_cmd,*sub_ins,*sub_trans;
+//
+//static void chassis_pub_init(void);
+//static void chassis_sub_init(void);
+//static void chassis_pub_push(void);
+//static void chassis_sub_pull(void);
+/* -------------------------------- 线程间通讯Topics相关 ------------------------------- */
+/* -------------------------------- 调试监测线程相关 --------------------------------- */
+static uint32_t usart_task_dwt = 0;   // 毫秒监测
+static float usart_task_dt = 0;       // 线程实际运行时间dt
+static float usart_task_delta = 0;    // 监测线程运行时间
+static float usart_task_start_dt = 0; // 监测线程开始时间
+/* -------------------------------- 调试监测线程相关 --------------------------------- */
+
+// 自定义控制器串口
+static volatile uint8_t usart1_rx_buffer_index = 0;  // 当前使用的接收缓冲区
+static volatile uint16_t usart1_rx_size = 0;
+static uint8_t usart1_rx_buffer[2][IoT_RX_BUF_SIZE];
+static SemaphoreHandle_t xSemaphoreUART1_RX = NULL;           // 通知任务处理信号量
+
+// 福斯遥控器
+static volatile uint8_t usart5_rx_buffer_index = 0;  // 当前使用的接收缓冲区
+static volatile uint16_t usart5_rx_size = 0;
+static uint8_t usart5_rx_buffer[2][SBUS_RX_BUF_SIZE];
+static SemaphoreHandle_t xSemaphoreUART5_RX = NULL;
+
+// 裁判系统串口 10
+static volatile uint8_t imu_rx_buffer_index = 0;  // 当前使用的接收缓冲区
+static volatile uint16_t referee_rx_size = 0;
+static uint8_t imu_rx_buffer[2][IMU_RX_BUF_SIZE];
+static SemaphoreHandle_t xSemaphoreUART10_RX = NULL;
+
+static QueueSetHandle_t xUartQueueSet = NULL; // 定义接收队列集句柄,统一管理串口中断信号量
+
+// usart7双缓冲发送，双缓冲没用，直接用单缓冲发送
+#define USART7_TX_DEBUG_BUFFER_SIZE 512 // printf发送缓冲区大小
+static char usart7_tx_debug_buffer[USART7_TX_DEBUG_BUFFER_SIZE];
+static SemaphoreHandle_t xSemaphoreUART7_TX = NULL; // 串口1发送信号量
+
+extern struct referee_fdb_msg referee_fdb;
+extern QueueHandle_t xKalmanOneQueue;
+static publisher_t *pub_imu_rpy;
+
+void usart_rx_semaphore_init(void)
+{
+    // FreeRTOS 初始化
+    xSemaphoreUART10_RX = xSemaphoreCreateBinary();  // <-- 在此处创建信号量
+    xSemaphoreUART1_RX = xSemaphoreCreateBinary();  // <-- 在此处创建信号量
+    xSemaphoreUART5_RX = xSemaphoreCreateBinary();  // <-- 在此处创建信号量
+    // 定义队列集（最多监听 3 个信号量）
+    xUartQueueSet = xQueueCreateSet(3);
+    // 将各串口信号量加入队列集
+    xQueueAddToSet(xSemaphoreUART1_RX, xUartQueueSet);
+    xQueueAddToSet(xSemaphoreUART5_RX, xUartQueueSet);
+    xQueueAddToSet(xSemaphoreUART10_RX, xUartQueueSet);
+}
+
+void usart_tx_semaphore_init(void)
+{
+    // 创建二值信号量（用于DMA传输同步）
+    xSemaphoreUART7_TX = xSemaphoreCreateBinary();
+    xSemaphoreGive(xSemaphoreUART7_TX);
+}
+
+void USART1_RX_DMA_Init(void) {
+    memset(usart1_rx_buffer, 0, sizeof(usart1_rx_buffer));
+    //使能DMA串口接收
+    HAL_UARTEx_ReceiveToIdle_DMA(&huart1, usart1_rx_buffer[usart1_rx_buffer_index], IoT_RX_BUF_SIZE);
+    // 关闭DMA的传输过半中断，仅保留完成中断
+    __HAL_DMA_DISABLE_IT(huart1.hdmarx, DMA_IT_HT);
+}
+
+
+
+void USART10_RX_DMA_Init(void) {
+    memset(imu_rx_buffer, 0, sizeof(imu_rx_buffer));
+    //使能DMA串口接收
+    HAL_UARTEx_ReceiveToIdle_DMA(&huart10, imu_rx_buffer[imu_rx_buffer_index], IMU_RX_BUF_SIZE);
+    // 关闭DMA的传输过半中断，仅保留完成中断
+    __HAL_DMA_DISABLE_IT(huart10.hdmarx, DMA_IT_HT);
+}
+
+void process_usart1_rx_data(void) {
+    uint8_t finishedBuffer;
+    // 非阻塞获取信号量（因为队列集已确保信号量有效）
+    if (xSemaphoreTake(xSemaphoreUART1_RX, 0) == pdTRUE) {
+
+        finishedBuffer = usart1_rx_buffer_index ^ 1;
+        /* 数据解析 */
+        IoT_data_unpack(usart1_rx_buffer[finishedBuffer], usart1_rx_size);
+        // 清零所有接收缓冲区数据
+        //memset(usart1_rx_buffer[finishedBuffer], 0, CUSTOMER_CONTROLLER_BUF_SIZE);
+        // 只清零当前使用的缓冲区数据
+        //memset(usart1_rx_buffer[finishedBuffer], 0, usart1_rx_size);
+
+    }
+}
+//void process_usart1_rx_data(void) {
+//    uint8_t finishedBuffer;
+//
+//    // 非阻塞获取信号量（因为队列集已确保信号量有效）
+//    if (xSemaphoreTake(xSemaphoreUART1_RX, 0) == pdTRUE) {
+//        finishedBuffer = usart1_rx_buffer_index ^ 1;
+//        /* 数据解析 */
+//        imu_data_unpack(usart1_rx_buffer[finishedBuffer], usart1_rx_size);
+//        vt13_remote_data_process(usart1_rx_buffer[finishedBuffer], usart1_rx_size);
+//        // 清零所有接收缓冲区数据
+//        //memset(usart1_rx_buffer[finishedBuffer], 0, CUSTOMER_CONTROLLER_BUF_SIZE);
+//        // 只清零当前使用的缓冲区数据
+//        // memset(usart1_rx_buffer[finishedBuffer], 0, usart1_rx_size);
+//
+//    }
+//}
+
+void process_uart5_rx_data(void) {
+    uint8_t finishedBuffer;
+
+    if (xSemaphoreTake(xSemaphoreUART5_RX, 0) == pdTRUE) {
+        finishedBuffer = usart5_rx_buffer_index ^ 1;
+        /* SBUS协议解析 */
+        sbus_data_unpack(usart5_rx_buffer[finishedBuffer], usart5_rx_size);
+
+        memset(usart5_rx_buffer[finishedBuffer], 0, SBUS_RX_BUF_SIZE);
+    }
+}
+
+void process_uart10_rx_data(void) {
+    uint8_t finishedBuffer;
+
+    if (xSemaphoreTake(xSemaphoreUART10_RX, 0) == pdTRUE) {
+        finishedBuffer = imu_rx_buffer_index ^ 1;
+        /* IMU姿态角数据解析 */
+        imu_data_unpack(imu_rx_buffer[finishedBuffer], referee_rx_size);
+
+        memset(imu_rx_buffer[finishedBuffer], 0, IMU_RX_BUF_SIZE);
+    }
+}
+
+
+/* -------------------------------- 线程入口 ------------------------------- */
+void UsartTask_Entry(void const * argument)
+{
+/* -------------------------------- 外设初始化段落 ------------------------------- */
+    QueueSetMemberHandle_t xActivatedMember;
+
+    USART1_RX_DMA_Init();
+    USART10_RX_DMA_Init();
+    pub_imu_rpy = pub_register("imu_rpy", sizeof(imu_rpy_data_t));
+/* -------------------------------- 外设初始化段落 ------------------------------- */
+
+/* -------------------------------- 线程间Topics初始化 ------------------------------- */
+//    chassis_pub_init();
+//    chassis_sub_init();
+/* -------------------------------- 线程间Topics初始化 ------------------------------- */
+/* -------------------------------- 调试监测线程调度 --------------------------------- */
+    usart_task_dt = dwt_get_delta(&usart_task_dwt);
+    usart_task_start_dt = dwt_get_time_ms();
+/* -------------------------------- 调试监测线程调度 --------------------------------- */
+    for(;;)
+    {
+/* -------------------------------- 调试监测线程调度 --------------------------------- */
+        usart_task_delta = dwt_get_time_ms() - usart_task_start_dt;
+        usart_task_start_dt = dwt_get_time_ms();
+        usart_task_dt = dwt_get_delta(&usart_task_dwt);
+/* -------------------------------- 调试监测线程调度 --------------------------------- */
+/* -------------------------------- 线程订阅Topics信息 ------------------------------- */
+//        chassis_sub_pull();
+/* -------------------------------- 线程订阅Topics信息 ------------------------------- */
+
+/* -------------------------------- 线程代码编写段落 ------------------------------- */
+        xActivatedMember = xQueueSelectFromSet(xUartQueueSet, portMAX_DELAY);
+
+        // 判断触发源并处理数据，根据串口数据的重要程度调整处理顺序
+        if (xActivatedMember == xSemaphoreUART1_RX) {
+            process_usart1_rx_data();  // 自定义控制器961200裁判系统
+        } else if (xActivatedMember == xSemaphoreUART5_RX) {
+            process_uart5_rx_data();  // 福斯遥控器 //100000
+        } else if (xActivatedMember == xSemaphoreUART10_RX) {
+            process_uart10_rx_data(); // /115200自定义控制器
+        }
+/* -------------------------------- 线程代码编写段落 ------------------------------- */
+
+/* -------------------------------- 线程发布Topics信息 ------------------------------- */
+//        chassis_pub_push();
+/* -------------------------------- 线程发布Topics信息 ------------------------------- */
+        vTaskDelay(1);
+    }
+}
+/* -------------------------------- 线程结束 ------------------------------- */
+
+/* -------------------------------- 线程间通讯Topics相关 ------------------------------- */
+///**
+// * @brief chassis 线程中所有发布者初始化
+// */
+//static void chassis_pub_init(void)
+//{
+//    pub_chassis = pub_register("chassis_fdb",sizeof(struct chassis_fdb_msg));
+//}
+//
+///**
+// * @brief chassis 线程中所有订阅者初始化
+// */
+//static void chassis_sub_init(void)
+//{
+//    sub_cmd = sub_register("chassis_cmd", sizeof(struct chassis_cmd_msg));
+//    sub_trans= sub_register("trans_fdb", sizeof(struct trans_fdb_msg));
+//    sub_ins = sub_register("ins_msg", sizeof(struct ins_msg));
+//}
+//
+///**
+// * @brief chassis 线程中所有发布者推送更新话题
+// */
+//static void chassis_pub_push(void)
+//{
+//    pub_push_msg(pub_chassis,&chassis_fdb);
+//}
+///**
+// * @brief chassis 线程中所有订阅者获取更新话题
+// */
+//static void chassis_sub_pull(void)
+//{
+//    sub_get_msg(sub_cmd, &chassis_cmd);
+//    sub_get_msg(sub_trans, &trans_fdb);
+//    sub_get_msg(sub_ins, &ins_data);
+//}
+/* -------------------------------- 线程间通讯Topics相关 ------------------------------- */
+void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef * huart, uint16_t Size)
+{
+    if(huart->Instance == UART5)
+    {
+        if (Size > SBUS_RX_BUF_SIZE)
+        {
+            return;
+        }
+        BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+
+        usart5_rx_size = Size;
+        usart5_rx_buffer_index = usart5_rx_buffer_index ^ 1;
+
+
+        xSemaphoreGiveFromISR(xSemaphoreUART5_RX, NULL);
+        portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+    }
+
+    else if (huart->Instance == USART10)
+    {
+        // 判断接收的数据大小是否限制，如果超过，则不处理
+        if (Size > IMU_RX_BUF_SIZE)
+        {
+            return;
+        }
+        BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+
+        referee_rx_size = Size;
+        imu_rx_buffer_index = imu_rx_buffer_index ^ 1;
+
+        HAL_UARTEx_ReceiveToIdle_DMA(&huart10, imu_rx_buffer[imu_rx_buffer_index], IMU_RX_BUF_SIZE);
+        __HAL_DMA_DISABLE_IT(huart10.hdmarx, DMA_IT_HT);
+
+        xSemaphoreGiveFromISR(xSemaphoreUART10_RX,NULL);
+        portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+    }
+    else if (huart->Instance == USART1)  // 修改判断条件
+    {
+
+        // 判断接收的数据大小是否限制，如果超过，则不处理
+        if (Size > 6)
+        {
+            return;
+        }
+        BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+
+        usart1_rx_size = Size;
+        usart1_rx_buffer_index = usart1_rx_buffer_index ^ 1;
+
+        HAL_UARTEx_ReceiveToIdle_DMA(&huart1,usart1_rx_buffer[usart1_rx_buffer_index],6);
+        __HAL_DMA_DISABLE_IT(huart1.hdmarx, DMA_IT_HT);
+
+        xSemaphoreGiveFromISR(xSemaphoreUART1_RX, NULL);
+        portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+    }
+}
+
+// DMA发送完成回调函数
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart) {
+    if (huart->Instance == UART7) {
+        // 释放信号量，表示DMA可以处理下一个缓冲区
+        BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+        xSemaphoreGiveFromISR(xSemaphoreUART7_TX, &xHigherPriorityTaskWoken);
+        // 如果需要唤醒更高优先级任务，则触发上下文切换
+        portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+    }
+}
+
+
+void HAL_UART_ErrorCallback(UART_HandleTypeDef * huart)
+{
+
+    if(huart->Instance == USART10)
+    {
+        HAL_UARTEx_ReceiveToIdle_DMA(&huart10, imu_rx_buffer[imu_rx_buffer_index], IMU_RX_BUF_SIZE); // 接收发生错误后重启
+        __HAL_DMA_DISABLE_IT(huart10.hdmarx, DMA_IT_HT);
+        memset(imu_rx_buffer, 0, sizeof(imu_rx_buffer));// 清除双缓存
+    }
+
+    if(huart->Instance == USART1)
+    {
+        HAL_UARTEx_ReceiveToIdle_DMA(&huart1, usart1_rx_buffer[usart1_rx_buffer_index], 6); // 接收发生错误后重启
+        __HAL_DMA_DISABLE_IT(huart1.hdmarx, DMA_IT_HT);
+        memset(usart1_rx_buffer, 0, sizeof(usart1_rx_buffer));// 清除双缓存
+    }
+}
+
+// 自定义DebugPrintf函数（类似printf）
+void USART7_DebugPrintf(const char *format, ...) {
+    va_list args;
+    uint16_t length;
+
+    // 等待DMA传输完成（获取信号量）
+    if (xSemaphoreTake(xSemaphoreUART7_TX, portMAX_DELAY) == pdTRUE) {
+
+        // 使用可变参数格式化字符串到当前缓冲区
+        va_start(args, format);
+        length = vsnprintf(usart7_tx_debug_buffer, USART7_TX_DEBUG_BUFFER_SIZE, format, args);
+        va_end(args);
+
+        // 确保字符串长度有效
+        if (length > 0) {
+            // 使用DMA异步发送当前缓冲区数据
+            HAL_UART_Transmit_DMA(&huart7, (uint8_t*)usart7_tx_debug_buffer, length);
+        } else {
+            // 长度无效时直接释放信号量
+            xSemaphoreGive(xSemaphoreUART7_TX);
+        }
+    }
+}
+static imu_rpy_data_t imu_rpy;
+extern uint8_t left_full[2];   // 左侧两个罐子是否有物体
+extern uint8_t right_full[2];   // 右侧两个罐子
+extern Auto_ctrl_mode auto_ctrl_mode;
+static float last_exec_time = 0;
+extern uint32_t store_1_pwm_set;
+extern uint32_t store_2_pwm_set;
+
+/**
+ * @brief IMU姿态角数据解包（USART10）
+ * 数据格式: 0x55 0x53 RollL RollH PitchL PitchH YawL YawH VL VH SUM
+ * 角度计算: Angle = RawValue / 32768 * 180
+ * 校验和:   SUM = 0x55 + 0x53 + RollL + RollH + PitchL + PitchH + YawL + YawH + VL + VH
+ */
+void imu_data_unpack(uint8_t *data, uint16_t len)
+{
+
+
+    for (uint16_t i = 0; i + IMU_PACKET_SIZE <= len; i++)
+    {
+        if (data[i] != IMU_HEADER1 || data[i + 1] != IMU_HEADER2)
+            continue;
+
+        uint8_t sum = 0;
+        for (uint8_t j = 0; j < IMU_PACKET_SIZE - 1; j++)
+        {
+            sum += data[i + j];
+        }
+
+        if (sum != data[i + IMU_PACKET_SIZE - 1])
+            continue;
+
+        int16_t roll_raw  = (int16_t)((uint16_t)data[i + 2] | ((uint16_t)data[i + 3] << 8));
+        int16_t pitch_raw = (int16_t)((uint16_t)data[i + 4] | ((uint16_t)data[i + 5] << 8));
+        int16_t yaw_raw   = (int16_t)((uint16_t)data[i + 6] | ((uint16_t)data[i + 7] << 8));
+
+        imu_rpy.roll  = (float)roll_raw  / 32768.0f * 180.0f;
+        imu_rpy.pitch = (float)pitch_raw / 32768.0f * 180.0f;
+        imu_rpy.yaw   = (float)yaw_raw   / 32768.0f * 180.0f;
+
+        xQueueSend(xKalmanOneQueue, &imu_rpy, 0);
+        pub_push_msg(pub_imu_rpy, &imu_rpy);
+
+        i += IMU_PACKET_SIZE - 1;
+    }
+}
+void IoT_data_unpack(uint8_t data[126], uint16_t len)
+{
+    // 1. 遍历整个缓冲区，寻找第一个有效的帧头帧尾
+    int found_idx = -1;
+    for (int i = 0; i + 5 < len; i++) {          // 至少需要6字节
+        if (data[i] == 0xFF && data[i+5] == 0xFE) {
+            found_idx = i;
+            break;                              // 只处理第一个找到的包
+        }
+    }
+    if (found_idx == -1) return;                // 未找到合法包
+
+    // 2. 8秒时间限制（与原始逻辑一致）
+
+    float now = dwt_get_time_ms();
+    if (now - last_exec_time < 5000) return;
+
+
+    // 3. 提取中间4个字节（有效载荷）
+    uint8_t *p = &data[found_idx + 1];          // p[0]~p[3] 对应原来的 data[1]~data[4]
+
+    // 4. 根据标志位执行对应动作（完全保留原始处理逻辑）
+    if (p[0] == 1) {
+        last_exec_time = now;
+        for (int i = 0; i < 2; i++) {
+            if (!left_full[i]) {
+                left_full[i] = 1;
+                AlgorithmTask_RunSequence(SEQ_LEFT_PLACE);
+                store_2_pwm_set = i ? 1833 : 500;
+                break;
+            }
+        }
+        return;
+    }
+    else if(p[1] == 1) {
+        last_exec_time = now;
+
+        for (int i = 0; i < 2; i++) {
+            if (left_full[i]) {
+                AlgorithmTask_RunSequence(SEQ_LEFT_GRAB);
+                left_full[i] = 0;
+                store_2_pwm_set = i ? 1833 : 500;
+                break;
+            }
+        }
+        return;
+    }
+    else if(p[2] == 1) {
+        last_exec_time = now;
+        for (int i = 0; i < 2; i++) {
+            if (!right_full[i]) {
+                AlgorithmTask_RunSequence(SEQ_RETURN_TO_CENTER);
+                right_full[i] = 1;
+                store_1_pwm_set = i ? 1833 : 500;
+                break;
+            }
+        }
+        return;
+    }
+    else if (p[3] == 1) {
+        last_exec_time = now;
+        int i, j;
+
+        for (i = 0; i < 2; i++) {
+            if (left_full[i]) {
+                for (j = 0; j < 2; j++) {
+                    if (!right_full[j]) {
+                        AlgorithmTask_RunSequence(SEQ_LEFT_GRAB_RIGHT_PLACE);
+                        left_full[i] = 0;
+                        right_full[j] = 1;
+                        store_1_pwm_set = i ? 500 : 1833;
+                        store_1_pwm_set = j ? 500 : 1833;
+                        return;
+                    }
+                }
+                return;
+            }
+        }
+        return;
+    }
+}

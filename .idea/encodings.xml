@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="Encoding">
+    <file url="file://$PROJECT_DIR$/Engineering_Robot_H723_/CMakeLists.txt" charset="GBK" />
+    <file url="file://$PROJECT_DIR$/Engineering_Robot_H723_/USER/Module/Motor/DM_Motor_Fdcan/dm_motor_ctrl.c" charset="GBK" />
+    <file url="file://$PROJECT_DIR$/Engineering_Robot_H723_/USER/Task/Balance/Balance_task.c" charset="GBK" />
+  </component>
+</project>

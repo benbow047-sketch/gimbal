@@ -1,0 +1,34 @@
+//
+// Created by Áõ¼Î¿¡ on 25-3-31.
+//
+
+#ifndef CTRBOARD_H7_ALL_TRANSMISSION_TASK_H
+#define CTRBOARD_H7_ALL_TRANSMISSION_TASK_H
+
+
+#include <stdint.h>
+#include "cmd_task.h"
+
+struct pc_cmd_arm_msg
+{
+    float joint_pos[6];
+    uint8_t control_state;
+    Gripper_mode_e gripper_ctrl;
+    int8_t pc_ctrl_process_state;
+};
+
+
+typedef enum
+{
+    STEP_HEADER_SOF  = 0,
+    STEP_ADDRESS  = 1,
+    STEP_ID  = 2,
+    STEP_LEN  = 3,
+    STEP_DATA  = 4,
+    STEP_SC  = 5,
+    STEP_AC  = 6,
+
+} unpack_transmission_step_e;
+
+
+#endif //CTRBOARD_H7_ALL_TRANSMISSION_TASK_H

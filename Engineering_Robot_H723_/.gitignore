@@ -1,0 +1,14 @@
+# ���Ա������ɵ������ļ���Ŀ¼
+cmake-build-debug/
+.claude/
+*.hex
+*.bin
+*.elf
+*.map
+*.obj
+*.obj.d
+*.log
+
+# ���� IDE ��ʱ�ļ�����ѡ��
+.idea/
+mx.scratch
