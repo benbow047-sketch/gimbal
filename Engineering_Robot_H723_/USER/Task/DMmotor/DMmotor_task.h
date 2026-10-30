@@ -22,7 +22,7 @@
 #define GIMBAL_YAW_MAX   (3.14f)
 
 // 云台电机运行速度
-#define GIMBAL_MOTOR_SPEED 5.0f
+#define GIMBAL_MOTOR_SPEED 7.0f
 
 // 浜斿彿鐢垫満鐨勮搴﹂檺鍒?
 #define MOTOR_5_MIN_LIMIT (-1.65f)  //

@@ -10,13 +10,16 @@
 #include "msg_freertos.h"
 #include "PID.h"
 #include "drv_dwt.h"
+#include "robot_task.h"
 #include <stdio.h>
 #include <string.h>
 
 /* -------------------------------- 线程间通讯Topics ------------------------------- */
 static subscriber_t *sub_imu_rpy;
+static subscriber_t *sub_chassis_imu;
 static publisher_t  *pub_gimbal_cmd;
 static imu_rpy_data_t imu_data;
+static struct ins_msg chassis_imu_data;
 static gimbal_cmd_t   gimbal_out;
 /* -------------------------------- 线程间通讯Topics ------------------------------- */
 
@@ -29,6 +32,9 @@ static pid_config_t gimbal_pitch_config = INIT_PID_CONFIG(
 );
 static float gimbal_motor_target_angle = 0.0f;
 static uint8_t gimbal_motor_target_initialized = 0;
+static float last_chassis_pitch = 0.0f;
+float gimbal_chassis_pitch_ff = 4.0f;
+float gimbal_pitch_ff_output = 0.0f;
 /* -------------------------------- PID控制器 ------------------------------- */
 
 /* -------------------------------- 调试监测 ------------------------------- */
@@ -41,6 +47,7 @@ static float balance_task_start_dt = 0;
 static void Balance_topic_init(void)
 {
     sub_imu_rpy   = sub_register("imu_rpy", sizeof(imu_rpy_data_t));
+    sub_chassis_imu = sub_register("ins_pub", sizeof(struct ins_msg));
     pub_gimbal_cmd = pub_register("gimbal_cmd", sizeof(gimbal_cmd_t));
 }
 
@@ -52,6 +59,7 @@ void BalanceTask_Entry(void const * argument)
     gimbal_pitch_pid = pid_register(&gimbal_pitch_config);
 
     memset(&imu_data, 0, sizeof(imu_data));
+    memset(&chassis_imu_data, 0, sizeof(chassis_imu_data));
     memset(&gimbal_out, 0, sizeof(gimbal_out));
 
     balance_task_dt = dwt_get_delta(&balance_task_dwt);
@@ -63,18 +71,18 @@ void BalanceTask_Entry(void const * argument)
         balance_task_start_dt = dwt_get_time_ms();
         balance_task_dt = dwt_get_delta(&balance_task_dwt);
 
+        sub_get_msg(sub_chassis_imu, &chassis_imu_data);
+
         /* 订阅IMU姿态数据 */
         if (sub_get_msg(sub_imu_rpy, &imu_data))
         {
             if (!gimbal_motor_target_initialized)
             {
-                if (motor[Motor8].para.state != 0)
-                {
-                    gimbal_motor_target_angle = motor[Motor8].para.pos;
-                    gimbal_motor_target_initialized = 1;
-                    pid_clear(gimbal_pitch_pid);
-                    (void)pid_calculate(gimbal_pitch_pid, imu_data.pitch, GIMBAL_TARGET_PITCH);
-                }
+                gimbal_motor_target_angle = motor[Motor8].para.pos;
+                last_chassis_pitch = chassis_imu_data.pitch;
+                gimbal_motor_target_initialized = 1;
+                pid_clear(gimbal_pitch_pid);
+                (void)pid_calculate(gimbal_pitch_pid, imu_data.pitch, GIMBAL_TARGET_PITCH);
             }
             else
             {
@@ -86,6 +94,12 @@ void BalanceTask_Entry(void const * argument)
 
                 if (imu_data.pitch * imu_data.pitch < 0.0225f)
                     target_speed = 0.0f;
+
+                float chassis_pitch_delta = chassis_imu_data.pitch - last_chassis_pitch;
+                last_chassis_pitch = chassis_imu_data.pitch;
+                gimbal_pitch_ff_output = gimbal_chassis_pitch_ff *
+                                         chassis_pitch_delta * 0.0174532925f;
+                gimbal_motor_target_angle += gimbal_pitch_ff_output;
 
                 if (control_dt > GIMBAL_CONTROL_DT_MAX)
                     control_dt = GIMBAL_CONTROL_DT_MAX;

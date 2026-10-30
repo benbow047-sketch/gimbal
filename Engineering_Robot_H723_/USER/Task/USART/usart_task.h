@@ -16,7 +16,8 @@ void IoT_data_unpack(uint8_t *data, uint16_t len);
 #define IMU_RX_BUF_SIZE     132         // 44字节/帧(4包)，3帧缓冲          // 11字节/帧，3帧缓冲
 #define IMU_PACKET_SIZE     11          // 固定数据包长度
 #define IMU_HEADER1         0x55        // 帧头1
-#define IMU_HEADER2         0x53        // 帧头2
+#define IMU_GYRO_FRAME      0x52        // 角速度帧
+#define IMU_ANGLE_FRAME     0x53        // 角度帧
 
 /**
  * @brief IMU原始数据包（11字节：0x55 0x53 RollL RollH PitchL PitchH YawL YawH VL VH SUM）
@@ -40,6 +41,7 @@ typedef struct __attribute__((__packed__))
     float roll;
     float pitch;
     float yaw;
+    float gyro[3];
 } imu_rpy_data_t;
 
 void imu_data_unpack(uint8_t *data, uint16_t len);

@@ -61,8 +61,6 @@ void DMmotorTask_Entry(void const * argument)
 {
     DMmotor_topic_init();
 
-    vTaskDelay(pdMS_TO_TICKS(2000));
-
     /* FDCAN2使能云台电机 Motor8(俯仰) Motor9(偏航) */
     dm_motor_enable(&hfdcan2, &motor[Motor8]);
     dm_motor_enable(&hfdcan2, &motor[Motor9]);

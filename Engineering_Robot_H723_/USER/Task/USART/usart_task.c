@@ -185,6 +185,18 @@ void UsartTask_Entry(void const * argument)
 
     USART1_RX_DMA_Init();
     USART10_RX_DMA_Init();
+
+    const uint8_t imu_unlock_cmd[5] = {0xFF, 0xAA, 0x69, 0x88, 0xB5};
+    const uint8_t imu_output_cmd[5] = {0xFF, 0xAA, 0x02, 0x0C, 0x00};
+    const uint8_t imu_rate_cmd[5]   = {0xFF, 0xAA, 0x03, 0x09, 0x00};
+
+    HAL_UART_Transmit(&huart10, imu_unlock_cmd, sizeof(imu_unlock_cmd), 100);
+    vTaskDelay(100);
+    HAL_UART_Transmit(&huart10, imu_output_cmd, sizeof(imu_output_cmd), 100);
+    vTaskDelay(100);
+    HAL_UART_Transmit(&huart10, imu_rate_cmd, sizeof(imu_rate_cmd), 100);
+    vTaskDelay(100);
+
     pub_imu_rpy = pub_register("imu_rpy", sizeof(imu_rpy_data_t));
 /* -------------------------------- 外设初始化段落 ------------------------------- */
 
@@ -394,7 +406,9 @@ void imu_data_unpack(uint8_t *data, uint16_t len)
 
     for (uint16_t i = 0; i + IMU_PACKET_SIZE <= len; i++)
     {
-        if (data[i] != IMU_HEADER1 || data[i + 1] != IMU_HEADER2)
+        if (data[i] != IMU_HEADER1 ||
+            (data[i + 1] != IMU_GYRO_FRAME &&
+             data[i + 1] != IMU_ANGLE_FRAME))
             continue;
 
         uint8_t sum = 0;
@@ -406,16 +420,25 @@ void imu_data_unpack(uint8_t *data, uint16_t len)
         if (sum != data[i + IMU_PACKET_SIZE - 1])
             continue;
 
-        int16_t roll_raw  = (int16_t)((uint16_t)data[i + 2] | ((uint16_t)data[i + 3] << 8));
-        int16_t pitch_raw = (int16_t)((uint16_t)data[i + 4] | ((uint16_t)data[i + 5] << 8));
-        int16_t yaw_raw   = (int16_t)((uint16_t)data[i + 6] | ((uint16_t)data[i + 7] << 8));
+        int16_t raw_x = (int16_t)((uint16_t)data[i + 2] | ((uint16_t)data[i + 3] << 8));
+        int16_t raw_y = (int16_t)((uint16_t)data[i + 4] | ((uint16_t)data[i + 5] << 8));
+        int16_t raw_z = (int16_t)((uint16_t)data[i + 6] | ((uint16_t)data[i + 7] << 8));
 
-        imu_rpy.roll  = (float)roll_raw  / 32768.0f * 180.0f;
-        imu_rpy.pitch = (float)pitch_raw / 32768.0f * 180.0f;
-        imu_rpy.yaw   = (float)yaw_raw   / 32768.0f * 180.0f;
+        if (data[i + 1] == IMU_GYRO_FRAME)
+        {
+            imu_rpy.gyro[0] = (float)raw_x / 32768.0f * 2000.0f;
+            imu_rpy.gyro[1] = (float)raw_y / 32768.0f * 2000.0f;
+            imu_rpy.gyro[2] = (float)raw_z / 32768.0f * 2000.0f;
+        }
+        else
+        {
+            imu_rpy.roll  = (float)raw_x / 32768.0f * 180.0f;
+            imu_rpy.pitch = (float)raw_y / 32768.0f * 180.0f;
+            imu_rpy.yaw   = (float)raw_z / 32768.0f * 180.0f;
 
-        xQueueSend(xKalmanOneQueue, &imu_rpy, 0);
-        pub_push_msg(pub_imu_rpy, &imu_rpy);
+            xQueueSend(xKalmanOneQueue, &imu_rpy, 0);
+            pub_push_msg(pub_imu_rpy, &imu_rpy);
+        }
 
         i += IMU_PACKET_SIZE - 1;
     }
